@@ -1,0 +1,11 @@
+[package]
+name = "project-squirrel"
+version = "0.1.0"
+edition = "2018"
+
+[dependencies]
+json = "^0.12.4"
+glob = "^0.3.0"
+getopts = "^0.2.21"
+zip = "^0.5.13"
+ureq = "^2.1.1"
