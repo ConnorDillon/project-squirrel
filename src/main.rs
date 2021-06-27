@@ -3,6 +3,7 @@ use getopts::Options;
 use glob::glob;
 use json;
 use std::collections::HashMap;
+use std::convert::TryInto;
 use std::env;
 use std::fs;
 use std::fs::File;
@@ -24,10 +25,11 @@ fn set_opts() -> Options {
     let mut opts = Options::new();
     opts.optflag("h", "help", "Show this help information.");
     opts.optflag(
-	"",
-	"no-snapshot",
-	"Don't create VSS shapshots. Please note that this will prevent \
-        collecting locked files from a live system.");
+        "",
+        "no-snapshot",
+        "Don't create VSS shapshots. Please note that this will prevent \
+        collecting locked files from a live system.",
+    );
     opts.optopt(
         "w",
         "working-dir",
@@ -284,5 +286,47 @@ fn copy_files<T: Write + Seek>(drive: &str, pattern: &str, archive: &mut ZipWrit
                 .unwrap();
             io::copy(&mut file_buf, archive).unwrap();
         }
+    }
+}
+
+fn go_to_mft(file: &mut File) {
+    let mut buf: Vec<u8> = vec![0; 512];
+    file.read_exact(&mut buf).unwrap();
+    let sector_size = u16::from_le_bytes(buf[11..13].try_into().unwrap());
+    let sectors_per_cluster: u16 = buf[13].into();
+    let cluster_size: u64 = (sector_size * sectors_per_cluster).into();
+    let mft_start_cluster = u64::from_le_bytes(buf[48..56].try_into().unwrap());
+    let mft_start = mft_start_cluster * cluster_size;
+    file.seek(io::SeekFrom::Start(mft_start)).unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hex_str<'a, T>(bs: T) -> String
+    where
+        T: Iterator<Item = &'a u8>,
+    {
+        bs.map(|x| {
+            if *x < 16 {
+                format!("0{:X} ", x)
+            } else {
+                format!("{:X} ", x)
+            }
+        })
+        .collect::<String>()
+    }
+
+    #[test]
+    fn test_go_to_mft() {
+        //let vol = r#"\\?\Volume{5fbbc88e-0000-0000-0000-300300000000}"#;
+        let vol = r#"\\.\C:"#;
+        let mut file = File::open(&vol).unwrap();
+        go_to_mft(&mut file);
+        let mut buf: Vec<u8> = vec![0; 512];
+        file.read_exact(&mut buf).unwrap();
+        println!("{}", hex_str(buf.iter()));
+	assert_eq!(&buf[0..4], "FILE".as_bytes())
     }
 }
