@@ -211,6 +211,7 @@ dependencies = [
 name = "project-squirrel"
 version = "0.1.0"
 dependencies = [
+ "byteorder",
  "getopts",
  "glob",
  "json",

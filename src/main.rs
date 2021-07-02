@@ -1,3 +1,4 @@
+use byteorder::{ReadBytesExt, LE};
 use getopts::Matches;
 use getopts::Options;
 use glob::glob;
@@ -10,9 +11,13 @@ use std::fs::File;
 use std::io;
 use std::io::BufReader;
 use std::io::BufWriter;
+use std::io::Cursor;
+use std::io::Error;
 use std::io::Read;
 use std::io::Seek;
+use std::io::SeekFrom;
 use std::io::Write;
+use std::ops::RangeTo;
 use std::os::windows::fs::symlink_dir;
 use std::path::Path;
 use std::path::PathBuf;
@@ -289,19 +294,70 @@ fn copy_files<T: Write + Seek>(drive: &str, pattern: &str, archive: &mut ZipWrit
     }
 }
 
-fn go_to_mft(file: &mut File) {
-    let mut buf: Vec<u8> = vec![0; 512];
-    file.read_exact(&mut buf).unwrap();
-    let sector_size = u16::from_le_bytes(buf[11..13].try_into().unwrap());
-    let sectors_per_cluster: u16 = buf[13].into();
+struct Boot {
+    sector_size: u16,
+    cluster_size: u64,
+    mft_start: u64,
+}
+
+fn parse_boot(buf: &[u8]) -> io::Result<Boot> {
+    let mut cur = Cursor::new(buf);
+    cur.seek(SeekFrom::Start(11))?;
+    let sector_size = cur.read_u16::<LE>()?;
+    let sectors_per_cluster = cur.read_u16::<LE>()?;
     let cluster_size: u64 = (sector_size * sectors_per_cluster).into();
-    let mft_start_cluster = u64::from_le_bytes(buf[48..56].try_into().unwrap());
+    cur.seek(SeekFrom::Start(48))?;
+    let mft_start_cluster = cur.read_u64::<LE>()?;
     let mft_start = mft_start_cluster * cluster_size;
-    file.seek(io::SeekFrom::Start(mft_start)).unwrap();
+    Ok(Boot {sector_size, cluster_size, mft_start})
+}
+
+struct MFTHeader {
+    fixup_offset: u16,
+    fixup_entries: u16,
+    attr_offset: u16,
+    flags: u16,
+    used_size: u32,
+    alloc_size: u32,
+}
+
+fn parse_mft_header(buf: &[u8]) -> io::Result<MFTHeader> {
+    let mut cur = Cursor::new(buf);
+    cur.seek(SeekFrom::Start(4))?;
+    let fixup_offset = cur.read_u16::<LE>()?;
+    let fixup_entries = cur.read_u16::<LE>()?;
+    cur.seek(SeekFrom::Start(20))?;
+    let attr_offset = cur.read_u16::<LE>()?;
+    let flags = cur.read_u16::<LE>()?;
+    let used_size = cur.read_u32::<LE>()?;
+    let alloc_size = cur.read_u32::<LE>()?;
+    Ok(MFTHeader {
+        fixup_offset,
+        fixup_entries,
+        attr_offset,
+        flags,
+        used_size,
+        alloc_size,
+    })
+}
+
+fn fixup_buf(boot: &Boot, mft_header: &MFTHeader, buf: &mut [u8]) {
+    let offset: usize = mft_header.fixup_offset.into();
+    let sig: [u8; 2] = buf[offset..offset + 2].try_into().unwrap();
+    for entry in 1..usize::from(mft_header.fixup_entries) {
+        let orig_offset = offset + (entry - 1) * 2;
+        let orig: [u8; 2] = buf[orig_offset..orig_offset + 2].try_into().unwrap();
+        let sector_end = entry * usize::from(boot.sector_size);
+        let check: &mut [u8] = &mut buf[sector_end - 2..sector_end];
+        assert_eq!(&sig, check);
+        check.copy_from_slice(&orig);
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::panic::catch_unwind;
+
     use super::*;
 
     fn hex_str<'a, T>(bs: T) -> String
@@ -318,15 +374,34 @@ mod tests {
         .collect::<String>()
     }
 
-    #[test]
-    fn test_go_to_mft() {
+    fn go_to_mft(buf: &mut [u8]) -> (File, Boot) {
         //let vol = r#"\\?\Volume{5fbbc88e-0000-0000-0000-300300000000}"#;
         let vol = r#"\\.\C:"#;
         let mut file = File::open(&vol).unwrap();
-        go_to_mft(&mut file);
-        let mut buf: Vec<u8> = vec![0; 512];
-        file.read_exact(&mut buf).unwrap();
+        file.read_exact(buf).unwrap();
+	let boot = parse_boot(&buf).unwrap();
+	file.seek(SeekFrom::Start(boot.mft_start)).unwrap();
+        file.read_exact(buf).unwrap();
+	(file, boot)
+    }
+
+    #[test]
+    fn test_parse_boot() {
+        let mut buf: [u8; 1024] = [0; 1024];
+	let _ = go_to_mft(&mut buf);
         println!("{}", hex_str(buf.iter()));
-	assert_eq!(&buf[0..4], "FILE".as_bytes())
+        assert_eq!(&buf[0..4], "FILE".as_bytes())
+    }
+
+    #[test]
+    fn test_fixup() {
+        let mut buf: [u8; 1024] = [0; 1024];
+	let (_, boot) = go_to_mft(&mut buf);
+        let header = parse_mft_header(&buf).unwrap();
+        fixup_buf(&boot, &header, &mut buf);
+        let fail = catch_unwind(move || {
+            fixup_buf(&boot, &header, &mut buf)
+        });
+        assert!(fail.is_err())
     }
 }
