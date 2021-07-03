@@ -437,7 +437,7 @@ fn parse_mft_attrs<T: Read + Seek>(cur: &mut T) -> io::Result<Vec<MFTAttr>> {
     Ok(attrs)
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 struct RunList {
     length: u64,
     offset: i64,
@@ -555,6 +555,24 @@ mod tests {
                 Content::Resident { .. } => (),
             }
         }
+    }
+
+    #[test]
+    fn test_parse_run_lists() {
+        let data: [u8; 8] = [0x21, 0x10, 0x00, 0x01, 0x11, 0x20, 0xE0, 0x00];
+        let mut cur = Cursor::new(data);
+        let run_lists = parse_run_lists(&mut cur).unwrap();
+        let valid = vec![
+            RunList {
+                length: 16,
+                offset: 256,
+            },
+            RunList {
+                length: 32,
+                offset: -32,
+            },
+        ];
+        assert_eq!(run_lists, valid);
     }
 
     //#[test]
