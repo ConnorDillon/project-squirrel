@@ -12,12 +12,10 @@ use std::io;
 use std::io::BufReader;
 use std::io::BufWriter;
 use std::io::Cursor;
-use std::io::Error;
 use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
-use std::ops::RangeTo;
 use std::os::windows::fs::symlink_dir;
 use std::path::Path;
 use std::path::PathBuf;
@@ -94,6 +92,7 @@ const PATHS: [(&str, &str); 10] = [
     ("scheduled-tasks", r#"C:\Windows\System32\Tasks\**\*"#),
 ];
 
+#[derive(Debug)]
 struct Params {
     help: bool,
     no_snapshot: bool,
@@ -294,6 +293,7 @@ fn copy_files<T: Write + Seek>(drive: &str, pattern: &str, archive: &mut ZipWrit
     }
 }
 
+#[derive(Debug)]
 struct Boot {
     sector_size: u16,
     cluster_size: u64,
@@ -309,9 +309,14 @@ fn parse_boot(buf: &[u8]) -> io::Result<Boot> {
     cur.seek(SeekFrom::Start(48))?;
     let mft_start_cluster = cur.read_u64::<LE>()?;
     let mft_start = mft_start_cluster * cluster_size;
-    Ok(Boot {sector_size, cluster_size, mft_start})
+    Ok(Boot {
+        sector_size,
+        cluster_size,
+        mft_start,
+    })
 }
 
+#[derive(Debug)]
 struct MFTHeader {
     fixup_offset: u16,
     fixup_entries: u16,
@@ -354,6 +359,127 @@ fn fixup_buf(boot: &Boot, mft_header: &MFTHeader, buf: &mut [u8]) {
     }
 }
 
+#[derive(Debug)]
+struct MFTAttr {
+    attr_type: u32,
+    length: u32,
+    name_length: u8,
+    name_offset: u16,
+    flags: u16,
+    attr_id: u16,
+    content: Content,
+}
+
+#[derive(Debug)]
+enum Content {
+    Resident {
+        size: u32,
+        offset: u16,
+    },
+    NonResident {
+        run_start_vcn: u64,
+        run_end_vcn: u64,
+        alloc_size: u64,
+        size: u64,
+        run_lists: Vec<RunList>,
+    },
+}
+
+fn parse_mft_attr<T: Read + Seek>(cur: &mut T) -> io::Result<MFTAttr> {
+    let start_pos = cur.stream_position()?;
+    let attr_type = cur.read_u32::<LE>()?;
+    let length = cur.read_u32::<LE>()?;
+    let non_resident = cur.read_u8()?;
+    let name_length = cur.read_u8()?;
+    let name_offset = cur.read_u16::<LE>()?;
+    let flags = cur.read_u16::<LE>()?;
+    let attr_id = cur.read_u16::<LE>()?;
+    let content = if non_resident == 0 {
+        let size = cur.read_u32::<LE>()?;
+        let offset = cur.read_u16::<LE>()?;
+        Content::Resident { size, offset }
+    } else {
+        let run_start_vcn = cur.read_u64::<LE>()?;
+        let run_end_vcn = cur.read_u64::<LE>()?;
+        let run_offset = cur.read_u16::<LE>()?;
+        cur.seek(SeekFrom::Current(6))?;
+        let alloc_size = cur.read_u64::<LE>()?;
+        let size = cur.read_u64::<LE>()?;
+        cur.seek(SeekFrom::Start(start_pos + u64::from(run_offset)))?;
+        let run_lists = parse_run_lists(cur)?;
+        Content::NonResident {
+            run_start_vcn,
+            run_end_vcn,
+            alloc_size,
+            size,
+            run_lists,
+        }
+    };
+    Ok(MFTAttr {
+        attr_type,
+        length,
+        name_length,
+        name_offset,
+        flags,
+        attr_id,
+        content,
+    })
+}
+
+fn parse_mft_attrs<T: Read + Seek>(cur: &mut T) -> io::Result<Vec<MFTAttr>> {
+    let mut attrs: Vec<MFTAttr> = Vec::new();
+    while cur.read_u16::<LE>()? != u16::MAX {
+        let pos = cur.seek(SeekFrom::Current(-2))?;
+        let attr = parse_mft_attr(cur)?;
+        cur.seek(SeekFrom::Start(pos + u64::from(attr.length)))?;
+        attrs.push(attr);
+    }
+    Ok(attrs)
+}
+
+#[derive(Debug)]
+struct RunList {
+    length: u64,
+    offset: i64,
+}
+
+fn read_bytes<T: Read>(num_bytes: u8, cur: &mut T, signed: bool) -> io::Result<[u8; 8]> {
+    assert!(num_bytes <= 8);
+    let mut bytes = Vec::with_capacity(8);
+    for _ in 0..num_bytes {
+        bytes.push(cur.read_u8()?);
+    }
+    let fill = if signed {
+        if let Some(b) = bytes.iter().last() {
+            if *b & 128 == 128 {
+                255
+            } else {
+                0
+            }
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    bytes.resize(8, fill);
+    Ok(bytes.try_into().unwrap())
+}
+
+fn parse_run_lists<T: Read + Seek>(cur: &mut T) -> io::Result<Vec<RunList>> {
+    let mut runs = Vec::new();
+    let mut first_byte = cur.read_u8()?;
+    while first_byte > 0 {
+        let length_length = u8::MAX.wrapping_shr(4) & first_byte;
+        let offset_length = first_byte.wrapping_shr(4);
+        let length = u64::from_le_bytes(read_bytes(length_length, cur, false)?);
+        let offset = i64::from_le_bytes(read_bytes(offset_length, cur, true)?);
+        runs.push(RunList { length, offset });
+        first_byte = cur.read_u8()?;
+    }
+    Ok(runs)
+}
+
 #[cfg(test)]
 mod tests {
     use std::panic::catch_unwind;
@@ -379,16 +505,16 @@ mod tests {
         let vol = r#"\\.\C:"#;
         let mut file = File::open(&vol).unwrap();
         file.read_exact(buf).unwrap();
-	let boot = parse_boot(&buf).unwrap();
-	file.seek(SeekFrom::Start(boot.mft_start)).unwrap();
+        let boot = parse_boot(&buf).unwrap();
+        file.seek(SeekFrom::Start(boot.mft_start)).unwrap();
         file.read_exact(buf).unwrap();
-	(file, boot)
+        (file, boot)
     }
 
     #[test]
     fn test_parse_boot() {
         let mut buf: [u8; 1024] = [0; 1024];
-	let _ = go_to_mft(&mut buf);
+        let _ = go_to_mft(&mut buf);
         println!("{}", hex_str(buf.iter()));
         assert_eq!(&buf[0..4], "FILE".as_bytes())
     }
@@ -396,12 +522,42 @@ mod tests {
     #[test]
     fn test_fixup() {
         let mut buf: [u8; 1024] = [0; 1024];
-	let (_, boot) = go_to_mft(&mut buf);
+        let (_, boot) = go_to_mft(&mut buf);
         let header = parse_mft_header(&buf).unwrap();
         fixup_buf(&boot, &header, &mut buf);
-        let fail = catch_unwind(move || {
-            fixup_buf(&boot, &header, &mut buf)
-        });
+        let fail = catch_unwind(move || fixup_buf(&boot, &header, &mut buf));
         assert!(fail.is_err())
     }
+
+    #[test]
+    fn test_parse_attrs() {
+        let mut buf: [u8; 1024] = [0; 1024];
+        let (_, boot) = go_to_mft(&mut buf);
+        let header = parse_mft_header(&buf).unwrap();
+        fixup_buf(&boot, &header, &mut buf);
+        let mut cur = Cursor::new(buf);
+        cur.seek(SeekFrom::Start(header.attr_offset.into()))
+            .unwrap();
+        let attrs = parse_mft_attrs(&mut cur).unwrap();
+        for attr in attrs {
+            println!("{:?}", &attr);
+            match attr.content {
+                Content::NonResident {
+                    run_lists,
+                    alloc_size,
+                    ..
+                } => {
+                    assert_eq!(
+                        alloc_size,
+                        boot.cluster_size * run_lists.iter().map(|x| x.length).sum::<u64>()
+                    )
+                }
+                Content::Resident { .. } => (),
+            }
+        }
+    }
+
+    //#[test]
+    //fn test_foo() {
+    //}
 }
