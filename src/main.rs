@@ -4,7 +4,7 @@ use getopts::Options;
 use glob::glob;
 use json;
 use std::collections::HashMap;
-use std::convert::TryInto;
+use std::convert::{TryFrom, TryInto};
 use std::env;
 use std::fs;
 use std::fs::File;
@@ -70,10 +70,11 @@ fn set_opts() -> Options {
     opts.optflag("s", "swapfile", "Collect swapfile.sys and pagefile.sys.");
     opts.optflag("u", "startup", "Collect files in the startup folder.");
     opts.optflag("t", "scheduled-tasks", "Collect Scheduled Tasks.");
+    opts.optflag("m", "mft", "Collect NTFS Master File Table ($MFT).");
     return opts;
 }
 
-const PATHS: [(&str, &str); 10] = [
+const PATHS: [(&str, &str); 11] = [
     ("prefetch", r#"C:\Windows\Prefetch\*.pf"#),
     ("registry", r#"C:\Windows\System32\config\*"#),
     ("event-logs", r#"C:\Windows\System32\winevt\logs\*.evtx"#),
@@ -90,6 +91,7 @@ const PATHS: [(&str, &str); 10] = [
     ("swapfile", r#"C:\????file.sys"#),
     ("startup", r#"C:\Users\*\Start Menu\Programs\Startup\*"#),
     ("scheduled-tasks", r#"C:\Windows\System32\Tasks\**\*"#),
+    ("mft", r#"C:\$MFT"#),
 ];
 
 #[derive(Debug)]
@@ -163,22 +165,23 @@ fn main() {
         for (drive, patterns) in params.paths.iter() {
             let drive_letter = &drive[0..1];
 
-            let snap = if params.no_snapshot {
+            let (volume, snap) = if params.no_snapshot {
                 env::set_current_dir(&drive).unwrap();
-                None
+                (format!("\\\\.\\{}:", drive_letter), None)
             } else {
                 let shadow_id = create_snapshot(drive);
                 let mount_point = join_path(
                     params.working_dir.clone(),
                     format!("mount-{}", drive_letter),
                 );
-                mount_snapshot(&shadow_id, &mount_point);
+                let device_id = get_device_object(&shadow_id);
+                mount_snapshot(&device_id, &mount_point);
                 env::set_current_dir(&mount_point).unwrap();
-                Some((shadow_id, mount_point))
+                (device_id, Some((shadow_id, mount_point)))
             };
 
             for pattern in patterns.iter() {
-                copy_files(drive_letter, pattern, &mut archive);
+                copy_files(&volume, drive_letter, pattern, &mut archive);
             }
 
             if let Some((shadow_id, mount_point)) = snap {
@@ -186,7 +189,10 @@ fn main() {
             }
         }
 
-        archive.finish().unwrap();
+        archive.flush().unwrap();
+        let mut file_buf = archive.finish().unwrap();
+        file_buf.flush().unwrap();
+
         if let Some(dest) = params.destination {
             let file = File::open(&archive_path).unwrap();
             let file_buf = BufReader::new(file);
@@ -250,7 +256,7 @@ fn delete_snapshot(shadow_id: &str, mount_point: &Path) {
     fs::remove_dir(mount_point).unwrap();
 }
 
-fn mount_snapshot(shadow_id: &str, mount_point: &Path) {
+fn get_device_object(shadow_id: &str) -> String {
     let command = format!(
         "(Get-CimInstance Win32_ShadowCopy | \
          Where-Object {{ $_.ID -eq \"{}\"}}).DeviceObject",
@@ -265,30 +271,48 @@ fn mount_snapshot(shadow_id: &str, mount_point: &Path) {
     if !stderr.is_empty() {
         panic!("{}", stderr)
     }
-    let device_id = format!(
-        "{}\\",
-        str::from_utf8(&output.stdout)
-            .expect("Failed to parse stdout as UTF-8")
-            .trim_end()
-    );
-    symlink_dir(&device_id, mount_point).expect(&format!(
+    let out = str::from_utf8(&output.stdout)
+        .expect("Failed to parse stdout as UTF-8")
+        .trim_end();
+    String::from(out)
+}
+
+fn mount_snapshot(device_id: &str, mount_point: &Path) {
+    let devid = format!("{}\\", device_id);
+    symlink_dir(&devid, mount_point).expect(&format!(
         "Failed to create symlink: {} {:?}",
-        device_id, mount_point
+        devid, mount_point
     ));
 }
 
-fn copy_files<T: Write + Seek>(drive: &str, pattern: &str, archive: &mut ZipWriter<T>) {
-    for entry in glob(pattern).unwrap() {
-        let path_buf = entry.unwrap();
-        let path = path_buf.to_str().unwrap();
-        if path_buf.as_path().is_file() {
-            println!("Copying {}", path);
-            let file = File::open(path).expect(&format!("Failed to open {}", path));
-            let mut file_buf = BufReader::new(file);
+fn copy_files<T: Write + Seek>(
+    volume: &str,
+    drive: &str,
+    pattern: &str,
+    archive: &mut ZipWriter<T>,
+) {
+    let opts = FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    match pattern {
+        "$MFT" => {
             archive
-                .start_file(format!("{}\\{}", drive, path), FileOptions::default())
+                .start_file(format!("{}\\{}", drive, "MFT"), opts)
                 .unwrap();
-            io::copy(&mut file_buf, archive).unwrap();
+            extract_mft(volume, archive).unwrap()
+        }
+        _ => {
+            for entry in glob(pattern).unwrap() {
+                let path_buf = entry.unwrap();
+                let path = path_buf.to_str().unwrap();
+                if path_buf.as_path().is_file() {
+                    println!("Copying {}", path);
+                    let file = File::open(path).expect(&format!("Failed to open {}", path));
+                    let mut file_buf = BufReader::new(file);
+                    archive
+                        .start_file(format!("{}\\{}", drive, path), opts)
+                        .unwrap();
+                    io::copy(&mut file_buf, archive).unwrap();
+                }
+            }
         }
     }
 }
@@ -296,7 +320,7 @@ fn copy_files<T: Write + Seek>(drive: &str, pattern: &str, archive: &mut ZipWrit
 #[derive(Debug)]
 struct Boot {
     sector_size: u16,
-    cluster_size: u64,
+    cluster_size: u16,
     mft_start: u64,
 }
 
@@ -305,10 +329,10 @@ fn parse_boot(buf: &[u8]) -> io::Result<Boot> {
     cur.seek(SeekFrom::Start(11))?;
     let sector_size = cur.read_u16::<LE>()?;
     let sectors_per_cluster = cur.read_u16::<LE>()?;
-    let cluster_size: u64 = (sector_size * sectors_per_cluster).into();
+    let cluster_size: u16 = (sector_size * sectors_per_cluster).into();
     cur.seek(SeekFrom::Start(48))?;
     let mft_start_cluster = cur.read_u64::<LE>()?;
-    let mft_start = mft_start_cluster * cluster_size;
+    let mft_start = mft_start_cluster * u64::from(cluster_size);
     Ok(Boot {
         sector_size,
         cluster_size,
@@ -373,8 +397,7 @@ struct MFTAttr {
 #[derive(Debug)]
 enum Content {
     Resident {
-        size: u32,
-        offset: u16,
+        data: Vec<u8>,
     },
     NonResident {
         run_start_vcn: u64,
@@ -397,7 +420,11 @@ fn parse_mft_attr<T: Read + Seek>(cur: &mut T) -> io::Result<MFTAttr> {
     let content = if non_resident == 0 {
         let size = cur.read_u32::<LE>()?;
         let offset = cur.read_u16::<LE>()?;
-        Content::Resident { size, offset }
+        cur.seek(SeekFrom::Start(start_pos + u64::from(offset)))?;
+        let mut data = Vec::new();
+        data.resize(size.try_into().unwrap(), 0);
+        cur.read_exact(data.as_mut_slice())?;
+        Content::Resident { data }
     } else {
         let run_start_vcn = cur.read_u64::<LE>()?;
         let run_end_vcn = cur.read_u64::<LE>()?;
@@ -480,6 +507,79 @@ fn parse_run_lists<T: Read + Seek>(cur: &mut T) -> io::Result<Vec<RunList>> {
     Ok(runs)
 }
 
+#[derive(Debug)]
+struct MFTEntry {
+    header: MFTHeader,
+    attrs: Vec<MFTAttr>,
+}
+
+fn parse_mft_entry(boot: &Boot, buf: &mut [u8]) -> io::Result<MFTEntry> {
+    let header = parse_mft_header(buf)?;
+    fixup_buf(&boot, &header, buf);
+    let mut cur = Cursor::new(buf);
+    cur.seek(SeekFrom::Start(header.attr_offset.into()))?;
+    let attrs = parse_mft_attrs(&mut cur)?;
+    Ok(MFTEntry { header, attrs })
+}
+
+fn write_content<T: Read + Seek, U: Write>(
+    boot: &Boot,
+    content: &Content,
+    source: &mut T,
+    dest: &mut U,
+) -> io::Result<()> {
+    match content {
+        Content::Resident { data } => {
+            dest.write(data.as_slice())?;
+        }
+        Content::NonResident {
+            size, run_lists, ..
+        } => {
+            let cs = u64::from(boot.cluster_size);
+            let mut offset: i64 = 0;
+            let mut remaining = *size;
+            let mut buf = Vec::new();
+            buf.resize(boot.cluster_size.into(), 0);
+            for run_list in run_lists {
+                offset = offset + run_list.offset;
+                source.seek(SeekFrom::Start(u64::try_from(offset).unwrap() * cs))?;
+                for i in 0..run_list.length {
+                    if remaining < cs {
+                        buf.resize(remaining.try_into().unwrap(), 0);
+                        assert_eq!(i + 1, run_list.length);
+                    }
+                    source.read_exact(buf.as_mut_slice())?;
+                    dest.write(buf.as_slice())?;
+                    remaining = remaining - cs;
+                }
+            }
+        }
+    };
+    Ok(())
+}
+
+fn go_to_mft(volume: &str, buf: &mut [u8]) -> (File, Boot) {
+    let mut file = File::open(volume).expect(volume);
+    file.read_exact(buf).unwrap();
+    let boot = parse_boot(&buf).unwrap();
+    file.seek(SeekFrom::Start(boot.mft_start)).unwrap();
+    file.read_exact(buf).unwrap();
+    (file, boot)
+}
+
+fn extract_mft<T: Write>(volume: &str, dest: &mut T) -> io::Result<()> {
+    println!("Copying $MFT");
+    let mut buf: [u8; 1024] = [0; 1024];
+    let (mut file, boot) = go_to_mft(volume, &mut buf);
+    let entry = parse_mft_entry(&boot, &mut buf)?;
+    for attr in entry.attrs {
+        if attr.attr_type == 128 {
+            write_content(&boot, &attr.content, &mut file, dest)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::panic::catch_unwind;
@@ -500,21 +600,10 @@ mod tests {
         .collect::<String>()
     }
 
-    fn go_to_mft(buf: &mut [u8]) -> (File, Boot) {
-        //let vol = r#"\\?\Volume{5fbbc88e-0000-0000-0000-300300000000}"#;
-        let vol = r#"\\.\C:"#;
-        let mut file = File::open(&vol).unwrap();
-        file.read_exact(buf).unwrap();
-        let boot = parse_boot(&buf).unwrap();
-        file.seek(SeekFrom::Start(boot.mft_start)).unwrap();
-        file.read_exact(buf).unwrap();
-        (file, boot)
-    }
-
     #[test]
     fn test_parse_boot() {
         let mut buf: [u8; 1024] = [0; 1024];
-        let _ = go_to_mft(&mut buf);
+        let _ = go_to_mft(r#"\\.\C:"#, &mut buf);
         println!("{}", hex_str(buf.iter()));
         assert_eq!(&buf[0..4], "FILE".as_bytes())
     }
@@ -522,7 +611,7 @@ mod tests {
     #[test]
     fn test_fixup() {
         let mut buf: [u8; 1024] = [0; 1024];
-        let (_, boot) = go_to_mft(&mut buf);
+        let (_, boot) = go_to_mft(r#"\\.\C:"#, &mut buf);
         let header = parse_mft_header(&buf).unwrap();
         fixup_buf(&boot, &header, &mut buf);
         let fail = catch_unwind(move || fixup_buf(&boot, &header, &mut buf));
@@ -532,7 +621,7 @@ mod tests {
     #[test]
     fn test_parse_attrs() {
         let mut buf: [u8; 1024] = [0; 1024];
-        let (_, boot) = go_to_mft(&mut buf);
+        let (_, boot) = go_to_mft(r#"\\.\C:"#, &mut buf);
         let header = parse_mft_header(&buf).unwrap();
         fixup_buf(&boot, &header, &mut buf);
         let mut cur = Cursor::new(buf);
@@ -549,7 +638,8 @@ mod tests {
                 } => {
                     assert_eq!(
                         alloc_size,
-                        boot.cluster_size * run_lists.iter().map(|x| x.length).sum::<u64>()
+                        u64::from(boot.cluster_size)
+                            * run_lists.iter().map(|x| x.length).sum::<u64>()
                     )
                 }
                 Content::Resident { .. } => (),
@@ -575,7 +665,23 @@ mod tests {
         assert_eq!(run_lists, valid);
     }
 
-    //#[test]
-    //fn test_foo() {
-    //}
+    #[test]
+    fn test_write_mft() {
+        let mut dest = File::create("MFT").unwrap();
+        let mut buf: [u8; 1024] = [0; 1024];
+        let (mut file, boot) = go_to_mft(r#"\\.\C:"#, &mut buf);
+        let entry = parse_mft_entry(&boot, &mut buf).unwrap();
+        for attr in entry.attrs {
+            if attr.attr_type == 128 {
+                write_content(&boot, &attr.content, &mut file, &mut dest).unwrap();
+                let file_size = dest.metadata().unwrap().len();
+                fs::remove_file("MFT").unwrap();
+                println!("MFT SIZE: {}", file_size);
+                match attr.content {
+                    Content::Resident { .. } => (),
+                    Content::NonResident { size, .. } => assert_eq!(size, file_size),
+                }
+            }
+        }
+    }
 }
