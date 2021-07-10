@@ -1,8 +1,9 @@
 use byteorder::{ReadBytesExt, LE};
 use std::convert::{TryFrom, TryInto};
 use std::fs::File;
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
-use std::{io, str};
+use std::io;
+use std::io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Write};
+use std::path::Path;
 
 #[derive(Debug)]
 struct Boot {
@@ -11,20 +12,10 @@ struct Boot {
     mft_start: u64,
 }
 
-fn parse_boot(buf: &[u8]) -> io::Result<Boot> {
-    let mut cur = Cursor::new(buf);
-    cur.seek(SeekFrom::Start(11))?;
-    let sector_size = cur.read_u16::<LE>()?;
-    let sectors_per_cluster = cur.read_u16::<LE>()?;
-    let cluster_size: u16 = (sector_size * sectors_per_cluster).into();
-    cur.seek(SeekFrom::Start(48))?;
-    let mft_start_cluster = cur.read_u64::<LE>()?;
-    let mft_start = mft_start_cluster * u64::from(cluster_size);
-    Ok(Boot {
-        sector_size,
-        cluster_size,
-        mft_start,
-    })
+#[derive(Debug)]
+struct MFTEntry {
+    header: MFTHeader,
+    attrs: Vec<MFTAttr>,
 }
 
 #[derive(Debug)]
@@ -35,39 +26,6 @@ struct MFTHeader {
     flags: u16,
     used_size: u32,
     alloc_size: u32,
-}
-
-fn parse_mft_header(buf: &[u8]) -> io::Result<MFTHeader> {
-    let mut cur = Cursor::new(buf);
-    cur.seek(SeekFrom::Start(4))?;
-    let fixup_offset = cur.read_u16::<LE>()?;
-    let fixup_entries = cur.read_u16::<LE>()?;
-    cur.seek(SeekFrom::Start(20))?;
-    let attr_offset = cur.read_u16::<LE>()?;
-    let flags = cur.read_u16::<LE>()?;
-    let used_size = cur.read_u32::<LE>()?;
-    let alloc_size = cur.read_u32::<LE>()?;
-    Ok(MFTHeader {
-        fixup_offset,
-        fixup_entries,
-        attr_offset,
-        flags,
-        used_size,
-        alloc_size,
-    })
-}
-
-fn fixup_buf(boot: &Boot, mft_header: &MFTHeader, buf: &mut [u8]) {
-    let offset: usize = mft_header.fixup_offset.into();
-    let sig: [u8; 2] = buf[offset..offset + 2].try_into().unwrap();
-    for entry in 1..usize::from(mft_header.fixup_entries) {
-        let orig_offset = offset + (entry - 1) * 2;
-        let orig: [u8; 2] = buf[orig_offset..orig_offset + 2].try_into().unwrap();
-        let sector_end = entry * usize::from(boot.sector_size);
-        let check: &mut [u8] = &mut buf[sector_end - 2..sector_end];
-        assert_eq!(&sig, check);
-        check.copy_from_slice(&orig);
-    }
 }
 
 #[derive(Debug)]
@@ -93,6 +51,103 @@ enum Content {
         size: u64,
         run_lists: Vec<RunList>,
     },
+}
+
+#[derive(Debug, PartialEq)]
+struct RunList {
+    length: u64,
+    offset: i64,
+}
+
+pub struct Volume<T> {
+    pub inner: BufReader<T>,
+}
+
+pub fn open_volume<P: AsRef<Path>>(path: P) -> io::Result<Volume<File>> {
+    Ok(Volume {
+        inner: BufReader::new(File::open(path)?),
+    })
+}
+
+impl<T: Read> Read for Volume<T> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
+    }
+    fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        self.inner.read_exact(buf)
+    }
+}
+
+impl<T: Read> BufRead for Volume<T> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        self.inner.fill_buf()
+    }
+    fn consume(&mut self, amt: usize) {
+        self.inner.consume(amt)
+    }
+}
+
+impl<T: Seek + Read> Seek for Volume<T> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        match pos {
+            SeekFrom::Current(x) => {
+                self.inner.fill_buf()?;
+                self.inner.seek_relative(x)?;
+                self.stream_position()
+            }
+            _ => self.inner.seek(pos),
+        }
+    }
+    fn stream_position(&mut self) -> io::Result<u64> {
+        self.inner.stream_position()
+    }
+}
+
+fn parse_boot<T: Seek + Read>(vol: &mut T) -> io::Result<Boot> {
+    vol.seek(SeekFrom::Current(11))?;
+    let sector_size = vol.read_u16::<LE>()?;
+    let sectors_per_cluster = vol.read_u16::<LE>()?;
+    let cluster_size: u16 = (sector_size * sectors_per_cluster).into();
+    vol.seek(SeekFrom::Current(33))?;
+    let mft_start_cluster = vol.read_u64::<LE>()?;
+    let mft_start = mft_start_cluster * u64::from(cluster_size);
+    Ok(Boot {
+        sector_size,
+        cluster_size,
+        mft_start,
+    })
+}
+
+fn parse_mft_header<T: Read + Seek>(vol: &mut T) -> io::Result<MFTHeader> {
+    vol.seek(SeekFrom::Current(4))?;
+    let fixup_offset = vol.read_u16::<LE>()?;
+    let fixup_entries = vol.read_u16::<LE>()?;
+    vol.seek(SeekFrom::Current(12))?;
+    let attr_offset = vol.read_u16::<LE>()?;
+    let flags = vol.read_u16::<LE>()?;
+    let used_size = vol.read_u32::<LE>()?;
+    let alloc_size = vol.read_u32::<LE>()?;
+    Ok(MFTHeader {
+        fixup_offset,
+        fixup_entries,
+        attr_offset,
+        flags,
+        used_size,
+        alloc_size,
+    })
+}
+
+fn fixup_buf(boot: &Boot, mft_header: &MFTHeader, buf: &mut [u8]) {
+    let offset: usize = mft_header.fixup_offset.into();
+    let sig: [u8; 2] = buf[offset..offset + 2].try_into().unwrap();
+    for entry in 1..usize::from(mft_header.fixup_entries) {
+        let orig_offset = offset + (entry - 1) * 2;
+        let orig: [u8; 2] = buf[orig_offset..orig_offset + 2].try_into().unwrap();
+        let sector_end = entry * usize::from(boot.sector_size);
+        let check: &mut [u8] = &mut buf[sector_end - 2..sector_end];
+        assert_eq!(&sig, check);
+        check.copy_from_slice(&orig);
+    }
 }
 
 fn parse_mft_attr<T: Read + Seek>(cur: &mut T) -> io::Result<MFTAttr> {
@@ -151,13 +206,7 @@ fn parse_mft_attrs<T: Read + Seek>(cur: &mut T) -> io::Result<Vec<MFTAttr>> {
     Ok(attrs)
 }
 
-#[derive(Debug, PartialEq)]
-struct RunList {
-    length: u64,
-    offset: i64,
-}
-
-fn read_bytes<T: Read>(num_bytes: u8, cur: &mut T, signed: bool) -> io::Result<[u8; 8]> {
+fn read_int_bytes<T: Read>(num_bytes: u8, cur: &mut T, signed: bool) -> io::Result<[u8; 8]> {
     assert!(num_bytes <= 8);
     let mut bytes = Vec::with_capacity(8);
     for _ in 0..num_bytes {
@@ -186,24 +235,20 @@ fn parse_run_lists<T: Read + Seek>(cur: &mut T) -> io::Result<Vec<RunList>> {
     while first_byte > 0 {
         let length_length = u8::MAX.wrapping_shr(4) & first_byte;
         let offset_length = first_byte.wrapping_shr(4);
-        let length = u64::from_le_bytes(read_bytes(length_length, cur, false)?);
-        let offset = i64::from_le_bytes(read_bytes(offset_length, cur, true)?);
+        let length = u64::from_le_bytes(read_int_bytes(length_length, cur, false)?);
+        let offset = i64::from_le_bytes(read_int_bytes(offset_length, cur, true)?);
         runs.push(RunList { length, offset });
         first_byte = cur.read_u8()?;
     }
     Ok(runs)
 }
 
-#[derive(Debug)]
-struct MFTEntry {
-    header: MFTHeader,
-    attrs: Vec<MFTAttr>,
-}
-
-fn parse_mft_entry(boot: &Boot, buf: &mut [u8]) -> io::Result<MFTEntry> {
-    let header = parse_mft_header(buf)?;
-    fixup_buf(&boot, &header, buf);
+fn parse_mft_entry<T: Read + Seek>(boot: &Boot, vol: &mut T) -> io::Result<MFTEntry> {
+    let mut buf = [0u8; 1024];
+    vol.read_exact(&mut buf)?;
     let mut cur = Cursor::new(buf);
+    let header = parse_mft_header(&mut cur)?;
+    fixup_buf(&boot, &header, &mut buf);
     cur.seek(SeekFrom::Start(header.attr_offset.into()))?;
     let attrs = parse_mft_attrs(&mut cur)?;
     Ok(MFTEntry { header, attrs })
@@ -245,23 +290,19 @@ fn write_content<T: Read + Seek, U: Write>(
     Ok(())
 }
 
-fn go_to_mft(volume: &str, buf: &mut [u8]) -> (File, Boot) {
-    let mut file = File::open(volume).expect(volume);
-    file.read_exact(buf).unwrap();
-    let boot = parse_boot(&buf).unwrap();
-    file.seek(SeekFrom::Start(boot.mft_start)).unwrap();
-    file.read_exact(buf).unwrap();
-    (file, boot)
+fn go_to_mft<T: Read + Seek>(boot: &Boot, vol: &mut T) -> io::Result<()> {
+    vol.seek(SeekFrom::Start(boot.mft_start))?;
+    Ok(())
 }
 
-pub fn extract_mft<T: Write>(volume: &str, dest: &mut T) -> io::Result<()> {
+pub fn extract_mft<T: Read + Seek, U: Write>(vol: &mut T, dest: &mut U) -> io::Result<()> {
     println!("Copying $MFT");
-    let mut buf: [u8; 1024] = [0; 1024];
-    let (mut file, boot) = go_to_mft(volume, &mut buf);
-    let entry = parse_mft_entry(&boot, &mut buf)?;
+    let boot = parse_boot(vol)?;
+    go_to_mft(&boot, vol)?;
+    let entry = parse_mft_entry(&boot, vol)?;
     for attr in entry.attrs {
         if attr.attr_type == 128 {
-            write_content(&boot, &attr.content, &mut file, dest)?;
+            write_content(&boot, &attr.content, vol, dest)?;
         }
     }
     Ok(())
@@ -290,7 +331,10 @@ mod tests {
     #[test]
     fn test_parse_boot() {
         let mut buf: [u8; 1024] = [0; 1024];
-        let _ = go_to_mft(r#"\\.\C:"#, &mut buf);
+        let mut vol = open_volume(r#"\\.\C:"#).unwrap();
+        let boot = parse_boot(&mut vol).unwrap();
+        go_to_mft(&boot, &mut vol).unwrap();
+        vol.read_exact(&mut buf).unwrap();
         println!("{}", hex_str(buf.iter()));
         assert_eq!(&buf[0..4], "FILE".as_bytes())
     }
@@ -298,8 +342,11 @@ mod tests {
     #[test]
     fn test_fixup() {
         let mut buf: [u8; 1024] = [0; 1024];
-        let (_, boot) = go_to_mft(r#"\\.\C:"#, &mut buf);
-        let header = parse_mft_header(&buf).unwrap();
+        let mut vol = open_volume(r#"\\.\C:"#).unwrap();
+        let boot = parse_boot(&mut vol).unwrap();
+        go_to_mft(&boot, &mut vol).unwrap();
+        vol.read_exact(&mut buf).unwrap();
+        let header = parse_mft_header(&mut vol).unwrap();
         fixup_buf(&boot, &header, &mut buf);
         let fail = catch_unwind(move || fixup_buf(&boot, &header, &mut buf));
         assert!(fail.is_err())
@@ -307,15 +354,11 @@ mod tests {
 
     #[test]
     fn test_parse_attrs() {
-        let mut buf: [u8; 1024] = [0; 1024];
-        let (_, boot) = go_to_mft(r#"\\.\C:"#, &mut buf);
-        let header = parse_mft_header(&buf).unwrap();
-        fixup_buf(&boot, &header, &mut buf);
-        let mut cur = Cursor::new(buf);
-        cur.seek(SeekFrom::Start(header.attr_offset.into()))
-            .unwrap();
-        let attrs = parse_mft_attrs(&mut cur).unwrap();
-        for attr in attrs {
+        let mut vol = open_volume(r#"\\.\C:"#).unwrap();
+        let boot = parse_boot(&mut vol).unwrap();
+        go_to_mft(&boot, &mut vol).unwrap();
+        let entry = parse_mft_entry(&boot, &mut vol).unwrap();
+        for attr in entry.attrs {
             println!("{:?}", &attr);
             match attr.content {
                 Content::NonResident {
@@ -355,12 +398,13 @@ mod tests {
     #[test]
     fn test_write_mft() {
         let mut dest = File::create("MFT").unwrap();
-        let mut buf: [u8; 1024] = [0; 1024];
-        let (mut file, boot) = go_to_mft(r#"\\.\C:"#, &mut buf);
-        let entry = parse_mft_entry(&boot, &mut buf).unwrap();
+        let mut vol = open_volume(r#"\\.\C:"#).unwrap();
+        let boot = parse_boot(&mut vol).unwrap();
+        go_to_mft(&boot, &mut vol).unwrap();
+        let entry = parse_mft_entry(&boot, &mut vol).unwrap();
         for attr in entry.attrs {
             if attr.attr_type == 128 {
-                write_content(&boot, &attr.content, &mut file, &mut dest).unwrap();
+                write_content(&boot, &attr.content, &mut vol, &mut dest).unwrap();
                 let file_size = dest.metadata().unwrap().len();
                 std::fs::remove_file("MFT").unwrap();
                 println!("MFT SIZE: {}", file_size);
