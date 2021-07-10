@@ -295,10 +295,10 @@ fn go_to_mft<T: Read + Seek>(boot: &Boot, vol: &mut T) -> io::Result<()> {
     Ok(())
 }
 
-pub fn extract_mft<T: Read + Seek, U: Write>(vol: &mut T, dest: &mut U) -> io::Result<()> {
-    println!("Copying $MFT");
+fn extract_file<T: Read + Seek, U: Write>(vol: &mut T, dest: &mut U, entry: i64) -> io::Result<()> {
     let boot = parse_boot(vol)?;
     go_to_mft(&boot, vol)?;
+    vol.seek(SeekFrom::Current(1024 * entry))?;
     let entry = parse_mft_entry(&boot, vol)?;
     for attr in entry.attrs {
         if attr.attr_type == 128 {
@@ -306,6 +306,16 @@ pub fn extract_mft<T: Read + Seek, U: Write>(vol: &mut T, dest: &mut U) -> io::R
         }
     }
     Ok(())
+}
+
+pub fn extract_mft<T: Read + Seek, U: Write>(vol: &mut T, dest: &mut U) -> io::Result<()> {
+    println!("Copying $MFT");
+    extract_file(vol, dest, 0)
+}
+
+pub fn extract_logfile<T: Read + Seek, U: Write>(vol: &mut T, dest: &mut U) -> io::Result<()> {
+    println!("Copying $LogFile");
+    extract_file(vol, dest, 2)
 }
 
 #[cfg(test)]

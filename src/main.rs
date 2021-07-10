@@ -1,4 +1,4 @@
-use getopts::{Options, Matches};
+use getopts::{Matches, Options};
 use glob::glob;
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -20,6 +20,11 @@ fn set_opts() -> Options {
         "no-snapshot",
         "Don't create VSS shapshots. Please note that this will prevent \
         collecting locked files from a live system.",
+    );
+    opts.optflag(
+        "",
+        "keep-snapshot",
+        "Don't clean up the created VSS shapshots (if any).",
     );
     opts.optopt(
         "w",
@@ -58,11 +63,12 @@ fn set_opts() -> Options {
     opts.optflag("s", "swapfile", "Collect swapfile.sys and pagefile.sys.");
     opts.optflag("u", "startup", "Collect files in the startup folder.");
     opts.optflag("t", "scheduled-tasks", "Collect Scheduled Tasks.");
-    opts.optflag("m", "mft", "Collect NTFS Master File Table ($MFT).");
+    opts.optflag("m", "mft", "Collect the NTFS Master File Table ($MFT).");
+    opts.optflag("l", "logfile", "Collect the NTFS Journal ($LogFile).");
     return opts;
 }
 
-const PATHS: [(&str, &str); 11] = [
+const PATHS: [(&str, &str); 12] = [
     ("prefetch", r#"C:\Windows\Prefetch\*.pf"#),
     ("registry", r#"C:\Windows\System32\config\*"#),
     ("event-logs", r#"C:\Windows\System32\winevt\logs\*.evtx"#),
@@ -80,12 +86,14 @@ const PATHS: [(&str, &str); 11] = [
     ("startup", r#"C:\Users\*\Start Menu\Programs\Startup\*"#),
     ("scheduled-tasks", r#"C:\Windows\System32\Tasks\**\*"#),
     ("mft", r#"C:\$MFT"#),
+    ("logfile", r#"C:\$LogFile"#),
 ];
 
 #[derive(Debug)]
 struct Params {
     help: bool,
     no_snapshot: bool,
+    keep_snapshot: bool,
     working_dir: PathBuf,
     destination: Option<String>,
     paths: Paths,
@@ -99,6 +107,7 @@ fn read_params(opts: &Options, args: &Vec<String>) -> Params {
     Params {
         help: matches.opt_present("help"),
         no_snapshot: matches.opt_present("no-snapshot"),
+        keep_snapshot: matches.opt_present("keep-snapshot"),
         working_dir: matches.opt_str("working-dir").map_or_else(
             || join_path(env::temp_dir(), "squirrel_work"),
             PathBuf::from,
@@ -173,13 +182,15 @@ fn main() {
             }
 
             if let Some((shadow_id, mount_point)) = snap {
-                delete_snapshot(&shadow_id, &mount_point);
+                fs::remove_dir(mount_point).unwrap();
+		if !params.keep_snapshot {
+                    delete_snapshot(&shadow_id);
+		}
             }
         }
 
         archive.flush().unwrap();
-        let mut file_buf = archive.finish().unwrap();
-        file_buf.flush().unwrap();
+        archive.finish().unwrap();
 
         if let Some(dest) = params.destination {
             let file = File::open(&archive_path).unwrap();
@@ -230,7 +241,7 @@ fn create_snapshot(volume: &str) -> String {
     }
 }
 
-fn delete_snapshot(shadow_id: &str, mount_point: &Path) {
+fn delete_snapshot(shadow_id: &str) {
     let args = [
         "delete",
         "shadows",
@@ -241,7 +252,6 @@ fn delete_snapshot(shadow_id: &str, mount_point: &Path) {
         .args(&args)
         .output()
         .expect("Failed to execute vssadmin");
-    fs::remove_dir(mount_point).unwrap();
 }
 
 fn get_device_object(shadow_id: &str) -> String {
@@ -281,6 +291,13 @@ fn copy_files<T: Write + Seek>(
 ) {
     let opts = FileOptions::default().compression_method(zip::CompressionMethod::Stored);
     match pattern {
+        "$LogFile" => {
+            let mut vol = mft::open_volume(volume).unwrap();
+            archive
+                .start_file(format!("{}\\{}", drive, "LogFile"), opts)
+                .unwrap();
+            mft::extract_logfile(&mut vol, archive).unwrap()
+        }
         "$MFT" => {
             let mut vol = mft::open_volume(volume).unwrap();
             archive
