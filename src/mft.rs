@@ -6,20 +6,20 @@ use std::io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 #[derive(Debug)]
-struct Boot {
+pub struct Boot {
     sector_size: u16,
     cluster_size: u16,
     mft_start: u64,
 }
 
 #[derive(Debug)]
-struct MFTEntry {
+pub struct MFTEntry {
     header: MFTHeader,
     attrs: Vec<MFTAttr>,
 }
 
 #[derive(Debug)]
-struct MFTHeader {
+pub struct MFTHeader {
     fixup_offset: u16,
     fixup_entries: u16,
     attr_offset: u16,
@@ -29,7 +29,7 @@ struct MFTHeader {
 }
 
 #[derive(Debug)]
-struct MFTAttr {
+pub struct MFTAttr {
     attr_type: u32,
     length: u32,
     name_length: u8,
@@ -40,7 +40,7 @@ struct MFTAttr {
 }
 
 #[derive(Debug)]
-enum Content {
+pub enum Content {
     Resident {
         data: Vec<u8>,
     },
@@ -54,7 +54,7 @@ enum Content {
 }
 
 #[derive(Debug, PartialEq)]
-struct RunList {
+pub struct RunList {
     length: u64,
     offset: i64,
 }
@@ -254,41 +254,131 @@ fn parse_mft_entry<T: Read + Seek>(boot: &Boot, vol: &mut T) -> io::Result<MFTEn
     Ok(MFTEntry { header, attrs })
 }
 
-fn write_content<T: Read + Seek, U: Write>(
+#[derive(Debug)]
+pub enum ContentReader<'a, T> {
+    Resident {
+        inner: Cursor<&'a [u8]>,
+    },
+    NonResident {
+        volume: Option<T>,
+        pos: u64,
+        offset: i64,
+        remaining: u64,
+        cluster_size: u64,
+        current_run: usize,
+        run_lists: &'a [RunList],
+    },
+}
+
+pub fn content_reader<'a, T: Read + Seek>(
+    volume: T,
     boot: &Boot,
-    content: &Content,
-    source: &mut T,
-    dest: &mut U,
-) -> io::Result<()> {
+    content: &'a Content,
+) -> ContentReader<'a, T> {
     match content {
-        Content::Resident { data } => {
-            dest.write(data.as_slice())?;
-        }
+        Content::Resident { data } => ContentReader::Resident {
+            inner: Cursor::new(data.as_slice()),
+        },
         Content::NonResident {
             size, run_lists, ..
-        } => {
-            let cs = u64::from(boot.cluster_size);
-            let mut offset: i64 = 0;
-            let mut remaining = *size;
-            let mut buf = Vec::new();
-            buf.resize(boot.cluster_size.into(), 0);
-            for run_list in run_lists {
-                offset = offset + run_list.offset;
-                source.seek(SeekFrom::Start(u64::try_from(offset).unwrap() * cs))?;
-                for i in 0..run_list.length {
-                    if remaining < cs {
-                        buf.resize(remaining.try_into().unwrap(), 0);
-                        assert_eq!(i + 1, run_list.length);
-                    }
-                    source.read_exact(buf.as_mut_slice())?;
-                    dest.write(buf.as_slice())?;
-                    remaining = remaining - cs;
+        } => ContentReader::NonResident {
+            volume: Some(volume),
+            pos: 0,
+            offset: 0,
+            remaining: *size,
+            cluster_size: boot.cluster_size.into(),
+            current_run: 0,
+            run_lists: run_lists.as_slice(),
+        },
+    }
+}
+
+impl<'a, T: Read + Seek> Read for ContentReader<'a, T> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            ContentReader::Resident { inner } => inner.read(buf),
+            ContentReader::NonResident {
+                cluster_size,
+                current_run,
+                remaining,
+                volume,
+                run_lists,
+                pos,
+                offset,
+            } => {
+                let mut run_len = run_lists[*current_run].length * *cluster_size;
+                let buf_len = u64::try_from(buf.len()).unwrap();
+                if *pos >= run_len && *remaining > 0 {
+                    debug_assert!(*pos == run_len);
+                    *current_run = *current_run + 1;
+                    *pos = 0;
+                    run_len = run_lists[*current_run].length * *cluster_size;
                 }
+                if *pos == 0 {
+                    *offset = *offset + run_lists[*current_run].offset;
+                    let start_offset = u64::try_from(*offset).unwrap() * *cluster_size;
+                    volume
+                        .as_mut()
+                        .unwrap()
+                        .seek(SeekFrom::Start(start_offset))?;
+                }
+                let max = if buf_len > *remaining {
+                    *remaining
+                } else {
+                    run_len - *pos
+                };
+                let result = if buf_len > max {
+                    let mut rdr = volume.take().unwrap().take(max);
+                    let count = rdr.read(buf)?;
+                    volume.insert(rdr.into_inner());
+                    count
+                } else {
+                    volume.as_mut().unwrap().read(buf)?
+                };
+		let result_u64 = u64::try_from(result).unwrap();
+                *pos = *pos + result_u64;
+                *remaining = *remaining - result_u64;
+                Ok(result)
             }
         }
-    };
-    Ok(())
+    }
 }
+
+//fn write_content<T: Read + Seek, U: Write>(
+//    boot: &Boot,
+//    content: &Content,
+//    source: &mut T,
+//    dest: &mut U,
+//) -> io::Result<()> {
+//    match content {
+//        Content::Resident { data } => {
+//            dest.write(data.as_slice())?;
+//        }
+//        Content::NonResident {
+//            size, run_lists, ..
+//        } => {
+//            let cs = u64::from(boot.cluster_size);
+//            let mut offset: i64 = 0;
+//            let mut remaining = *size;
+//            let mut buf = Vec::new();
+//            buf.resize(boot.cluster_size.into(), 0);
+//            for run_list in run_lists {
+//                offset = offset + run_list.offset;
+//                source.seek(SeekFrom::Start(u64::try_from(offset).unwrap() * cs))?;
+//                for i in 0..run_list.length {
+//                    if remaining < cs {
+//                        buf.resize(remaining.try_into().unwrap(), 0);
+//                        assert_eq!(i + 1, run_list.length);
+//                    }
+//                    source.read_exact(buf.as_mut_slice())?;
+//                    dest.write(buf.as_slice())?;
+//                    remaining = remaining - cs;
+//                }
+//            }
+//        }
+//    };
+//    Ok(())
+//}
 
 fn go_to_mft<T: Read + Seek>(boot: &Boot, vol: &mut T) -> io::Result<()> {
     vol.seek(SeekFrom::Start(boot.mft_start))?;
@@ -302,7 +392,9 @@ fn extract_file<T: Read + Seek, U: Write>(vol: &mut T, dest: &mut U, entry: i64)
     let entry = parse_mft_entry(&boot, vol)?;
     for attr in entry.attrs {
         if attr.attr_type == 128 {
-            write_content(&boot, &attr.content, vol, dest)?;
+            let mut reader = content_reader(vol, &boot, &attr.content);
+            io::copy(&mut reader, dest).unwrap();
+	    return Ok(())
         }
     }
     Ok(())
@@ -414,7 +506,8 @@ mod tests {
         let entry = parse_mft_entry(&boot, &mut vol).unwrap();
         for attr in entry.attrs {
             if attr.attr_type == 128 {
-                write_content(&boot, &attr.content, &mut vol, &mut dest).unwrap();
+                let mut reader = content_reader(&mut vol, &boot, &attr.content);
+                io::copy(&mut reader, &mut dest).unwrap();
                 let file_size = dest.metadata().unwrap().len();
                 std::fs::remove_file("MFT").unwrap();
                 println!("MFT SIZE: {}", file_size);
