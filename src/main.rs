@@ -292,18 +292,16 @@ fn copy_files<T: Write + Seek>(
     let opts = FileOptions::default().compression_method(zip::CompressionMethod::Stored);
     match pattern {
         "$LogFile" => {
-            let mut vol = mft::open_volume(volume).unwrap();
             archive
                 .start_file(format!("{}\\{}", drive, "LogFile"), opts)
                 .unwrap();
-            mft::extract_logfile(&mut vol, archive).unwrap()
+            mft::extract_logfile(volume, archive).unwrap()
         }
         "$MFT" => {
-            let mut vol = mft::open_volume(volume).unwrap();
             archive
                 .start_file(format!("{}\\{}", drive, "MFT"), opts)
                 .unwrap();
-            mft::extract_mft(&mut vol, archive).unwrap()
+            mft::extract_mft(volume, archive).unwrap()
         }
         _ => {
             for entry in glob(pattern).unwrap() {
