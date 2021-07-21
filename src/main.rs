@@ -40,7 +40,7 @@ fn set_opts() -> Options {
         "d",
         "destination",
         "Where to transfer the collected files. If this flag is not \
-         specified the working dir won't be removed and archive.zip \
+         specified the working dir won't be removed and archive.tar.gz \
          can be collected mantually.",
         "URL",
     );
@@ -156,7 +156,7 @@ fn main() {
         if !params.working_dir.exists() {
             fs::create_dir(&params.working_dir).unwrap();
         }
-        let archive_path = join_path(params.working_dir.clone(), "archive.tar");
+        let archive_path = join_path(params.working_dir.clone(), "archive.tar.gz");
         let file = File::create(&archive_path).unwrap();
         let file_buf = BufWriter::new(file);
         let mut archive = TarGzWriter::new(file_buf);

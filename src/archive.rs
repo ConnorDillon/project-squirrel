@@ -1,8 +1,8 @@
+use flate2::{write::GzEncoder, Compression};
 use std::{
     io::{self, Read, Write},
     path::Path,
 };
-
 use tar::{Builder, Header};
 
 pub trait ArchiveWrite {
@@ -25,13 +25,13 @@ impl<W: Write> ArchiveWrite for TarGzWriter<W> {
 }
 
 pub struct TarGzWriter<W: Write> {
-    inner: Builder<W>,
+    inner: Builder<GzEncoder<W>>,
 }
 
 impl<W: Write> TarGzWriter<W> {
     pub fn new(inner: W) -> TarGzWriter<W> {
         TarGzWriter {
-            inner: Builder::new(inner),
+            inner: Builder::new(GzEncoder::new(inner, Compression::fast())),
         }
     }
 }
