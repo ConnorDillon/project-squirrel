@@ -9,10 +9,10 @@ use std::process::Command;
 use std::{env, str};
 
 use crate::archive::{ArchiveWrite, TarGzWriter};
-use crate::mft::MFT;
+use crate::ntfs::MFT;
 
 mod archive;
-mod mft;
+mod ntfs;
 
 fn set_opts() -> Options {
     let mut opts = Options::new();
