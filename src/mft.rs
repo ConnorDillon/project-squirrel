@@ -104,7 +104,7 @@ pub struct Volume<T> {
 
 pub fn open_volume<P: AsRef<Path>>(path: P) -> io::Result<Volume<File>> {
     Ok(Volume {
-        inner: BufReader::new(File::open(path)?),
+        inner: BufReader::with_capacity(1024 * 1024, File::open(path)?),
     })
 }
 
@@ -574,11 +574,7 @@ mod tests {
         for attr in entry.attrs {
             println!("{:?}", &attr);
             match attr.content {
-                Content::NonResident {
-                    runs,
-                    size,
-                    ..
-                } => {
+                Content::NonResident { runs, size, .. } => {
                     assert_eq!(size, runs.iter().map(|x| x.len).sum::<u64>())
                 }
                 Content::Resident { .. } => (),
@@ -607,17 +603,19 @@ mod tests {
     }
 
     #[test]
-    fn test_write_mft() {
-        let mut dest = File::create("MFT").unwrap();
-        let mut vol = open_volume(r#"\\.\C:"#).unwrap();
-        let boot = parse_boot(&mut vol).unwrap();
-        go_to_mft(&boot, &mut vol).unwrap();
-        let entry = parse_mft_entry(&boot, r#"\\.\C:"#, &mut vol).unwrap();
+    fn test_read_mft() {
+        let mut mft = MFT::open(r#"\\.\C:"#).unwrap();
+        let entry = mft.open_entry(0).unwrap();
         let mut data = entry.data().unwrap().unwrap();
-        io::copy(&mut data, &mut dest).unwrap();
-        let file_size = dest.metadata().unwrap().len();
-        std::fs::remove_file("MFT").unwrap();
-        assert_eq!(data.size(), file_size);
+        let mut buf = [0u8; 1024];
+        for i in 0..data.size() / 1024 {
+            data.read_exact(&mut buf).unwrap();
+            assert!(
+                buf[0..4] == [0u8; 4][..] || buf[0..4] == b"FILE"[..],
+                "Failed at iteration {}",
+                i
+            );
+        }
     }
 
     #[test]
