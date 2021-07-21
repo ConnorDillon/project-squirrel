@@ -2,7 +2,7 @@ use byteorder::{ReadBytesExt, LE};
 use std::convert::{TryFrom, TryInto};
 use std::fs::File;
 use std::io;
-use std::io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::rc::Rc;
 
@@ -401,23 +401,6 @@ impl<T: Seek + Read> Seek for ContentReader<T> {
 fn go_to_mft<T: Read + Seek>(boot: &Boot, vol: &mut T) -> io::Result<()> {
     vol.seek(SeekFrom::Start(boot.mft_start))?;
     Ok(())
-}
-
-fn extract_file<T: Into<String>, U: Write>(vol: T, dest: &mut U, entry: i64) -> io::Result<()> {
-    let mut mft = MFT::open(vol)?;
-    let entry = mft.open_entry(entry)?;
-    io::copy(&mut entry.data()?.unwrap(), dest).unwrap();
-    Ok(())
-}
-
-pub fn extract_mft<T: Into<String>, U: Write>(vol: T, dest: &mut U) -> io::Result<()> {
-    println!("Copying $MFT");
-    extract_file(vol, dest, 0)
-}
-
-pub fn extract_logfile<T: Into<String>, U: Write>(vol: T, dest: &mut U) -> io::Result<()> {
-    println!("Copying $LogFile");
-    extract_file(vol, dest, 2)
 }
 
 #[derive(Debug)]

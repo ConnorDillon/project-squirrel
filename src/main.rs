@@ -2,14 +2,16 @@ use getopts::{Matches, Options};
 use glob::glob;
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Seek, Write};
+use std::io::{BufReader, BufWriter, Read};
 use std::os::windows::fs::symlink_dir;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::{env, io, str};
-use zip::write::FileOptions;
-use zip::ZipWriter;
+use std::{env, str};
 
+use crate::archive::{ArchiveWrite, TarGzWriter};
+use crate::mft::MFT;
+
+mod archive;
 mod mft;
 
 fn set_opts() -> Options {
@@ -154,10 +156,10 @@ fn main() {
         if !params.working_dir.exists() {
             fs::create_dir(&params.working_dir).unwrap();
         }
-        let archive_path = join_path(params.working_dir.clone(), "archive.zip");
+        let archive_path = join_path(params.working_dir.clone(), "archive.tar");
         let file = File::create(&archive_path).unwrap();
         let file_buf = BufWriter::new(file);
-        let mut archive = ZipWriter::new(file_buf);
+        let mut archive = TarGzWriter::new(file_buf);
 
         for (drive, patterns) in params.paths.iter() {
             let drive_letter = &drive[0..1];
@@ -183,13 +185,12 @@ fn main() {
 
             if let Some((shadow_id, mount_point)) = snap {
                 fs::remove_dir(mount_point).unwrap();
-		if !params.keep_snapshot {
+                if !params.keep_snapshot {
                     delete_snapshot(&shadow_id);
-		}
+                }
             }
         }
 
-        archive.flush().unwrap();
         archive.finish().unwrap();
 
         if let Some(dest) = params.destination {
@@ -283,25 +284,25 @@ fn mount_snapshot(device_id: &str, mount_point: &Path) {
     ));
 }
 
-fn copy_files<T: Write + Seek>(
-    volume: &str,
-    drive: &str,
-    pattern: &str,
-    archive: &mut ZipWriter<T>,
-) {
-    let opts = FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+fn copy_files<T: ArchiveWrite>(volume: &str, drive: &str, pattern: &str, archive: &mut T) {
     match pattern {
         "$LogFile" => {
+            println!("Copying LogFile");
+            let mut mft = MFT::open(volume).unwrap();
+            let entry = mft.open_entry(2).unwrap();
+            let data = entry.data().unwrap().unwrap();
             archive
-                .start_file(format!("{}\\{}", drive, "LogFile"), opts)
+                .add_file(format!("{}\\{}", drive, "LogFile"), data.size(), data)
                 .unwrap();
-            mft::extract_logfile(volume, archive).unwrap()
         }
         "$MFT" => {
+            println!("Copying MFT");
+            let mut mft = MFT::open(volume).unwrap();
+            let entry = mft.open_entry(0).unwrap();
+            let data = entry.data().unwrap().unwrap();
             archive
-                .start_file(format!("{}\\{}", drive, "MFT"), opts)
+                .add_file(format!("{}\\{}", drive, "MFT"), data.size(), data)
                 .unwrap();
-            mft::extract_mft(volume, archive).unwrap()
         }
         _ => {
             for entry in glob(pattern).unwrap() {
@@ -310,11 +311,11 @@ fn copy_files<T: Write + Seek>(
                 if path_buf.as_path().is_file() {
                     println!("Copying {}", path);
                     let file = File::open(path).expect(&format!("Failed to open {}", path));
-                    let mut file_buf = BufReader::new(file);
+                    let file_size = file.metadata().unwrap().len();
+                    let file_buf = BufReader::new(file);
                     archive
-                        .start_file(format!("{}\\{}", drive, path), opts)
+                        .add_file(format!("{}\\{}", drive, path), file_size, file_buf)
                         .unwrap();
-                    io::copy(&mut file_buf, archive).unwrap();
                 }
             }
         }
