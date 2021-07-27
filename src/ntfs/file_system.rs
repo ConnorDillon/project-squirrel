@@ -2,13 +2,13 @@ use byteorder::{ReadBytesExt, LE};
 use std::convert::TryFrom;
 use std::fs::File;
 use std::io;
+use std::io::Cursor;
 use std::io::{Read, Seek, SeekFrom};
 
 use super::content::{open_volume, ContentReader, Volume};
 use super::metadata::{parse_mft_entry, MFTEntry};
 
 pub struct MFT {
-    pub volume: String,
     pub data: ContentReader<Volume<File>>,
     pub boot: Boot,
 }
@@ -19,27 +19,22 @@ impl MFT {
         let mut vol = open_volume(&vol_path)?;
         let boot = parse_boot(&mut vol)?;
         go_to_mft(&boot, &mut vol)?;
-        let entry = parse_mft_entry(
-            boot.sector_size,
-            boot.cluster_size,
-            vol_path.clone(),
-            &mut vol,
-        )?;
-        let data = entry.data()?.unwrap();
-        go_to_mft(&boot, &mut vol)?;
+        let mut buf = [0u8; 1024];
+        vol.read_exact(&mut buf)?;
+        let entry = parse_mft_entry(boot.sector_size, boot.cluster_size, vol, Cursor::new(buf))?;
+        let data = entry.into_data()?.unwrap();
         Ok(MFT {
-            volume: vol_path,
             data,
             boot,
         })
     }
-    pub fn open_entry(&mut self, idx: i64) -> io::Result<MFTEntry> {
+    pub fn open_entry<T>(&mut self, volume: T, idx: i64) -> io::Result<MFTEntry<T>> {
         self.data
             .seek(SeekFrom::Start(u64::try_from(idx).unwrap() * 1024))?;
         parse_mft_entry(
             self.boot.sector_size,
             self.boot.cluster_size,
-            &self.volume,
+            volume,
             &mut self.data,
         )
     }
@@ -104,11 +99,9 @@ mod tests {
     #[test]
     fn test_read_mft() {
         let mut mft = MFT::open(r#"\\.\C:"#).unwrap();
-        let entry = mft.open_entry(0).unwrap();
-        let mut data = entry.data().unwrap().unwrap();
         let mut buf = [0u8; 1024];
-        for i in 0..data.size() / 1024 {
-            data.read_exact(&mut buf).unwrap();
+        for i in 0..mft.data.size() / 1024 {
+            mft.data.read_exact(&mut buf).unwrap();
             assert!(
                 buf[0..4] == [0u8; 4][..] || buf[0..4] == b"FILE"[..],
                 "Failed at iteration {}",
@@ -121,7 +114,8 @@ mod tests {
     fn test_write_logfile() {
         let mut dest = File::create("LogFile").unwrap();
         let mut mft = MFT::open(r#"\\.\C:"#).unwrap();
-        let entry = mft.open_entry(2).unwrap();
+        let mut vol = open_volume(r#"\\.\C:"#).unwrap();
+        let mut entry = mft.open_entry(&mut vol, 2).unwrap();
         let mut data = entry.data().unwrap().unwrap();
         io::copy(&mut data, &mut dest).unwrap();
         let file_size = dest.metadata().unwrap().len();

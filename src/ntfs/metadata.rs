@@ -1,32 +1,32 @@
 use byteorder::{ReadBytesExt, LE};
 use std::convert::{TryFrom, TryInto};
-use std::fs::File;
-use std::io;
-use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::io::{self, Cursor, Read, Seek, SeekFrom};
 
-use super::content::{
-    content_reader, load_runs, open_volume, Content, ContentReader, DataRun, Volume,
-};
+use super::content::{load_runs, Content, ContentReader, DataRun};
 
 #[derive(Debug)]
-pub struct MFTEntry {
-    volume: String,
+pub struct MFTEntry<T> {
+    volume: T,
     header: MFTHeader,
     attrs: Vec<MFTAttr>,
 }
 
-impl MFTEntry {
-    fn content(&self) -> Option<&Content> {
+impl<T: Read + Seek> MFTEntry<T> {
+    pub fn data(&mut self) -> io::Result<Option<ContentReader<&mut T>>> {
         for attr in &self.attrs {
             if attr.attr_type == 128 {
-                return Some(&attr.content);
+                return Ok(Some(attr.content.reader(&mut self.volume)));
             }
         }
-        None
+	Ok(None)
     }
-    pub fn data(&self) -> io::Result<Option<ContentReader<Volume<File>>>> {
-        let vol = open_volume(&self.volume)?;
-        Ok(self.content().map(|x| content_reader(vol, x)))
+    pub fn into_data(self) -> io::Result<Option<ContentReader<T>>> {
+        for attr in self.attrs {
+            if attr.attr_type == 128 {
+                return Ok(Some(attr.content.reader(self.volume)));
+            }
+        }
+	Ok(None)
     }
 }
 
@@ -42,23 +42,23 @@ pub struct MFTHeader {
 
 #[derive(Debug)]
 pub struct MFTAttr {
-    attr_type: u32,
+    pub attr_type: u32,
     length: u32,
     name_length: u8,
     name_offset: u16,
     flags: u16,
     attr_id: u16,
-    content: Content,
+    pub content: Content,
 }
 
-pub fn parse_mft_entry<T: Read + Seek, U: Into<String>>(
+pub fn parse_mft_entry<T, U: Read>(
     sector_size: u16,
     cluster_size: u16,
-    vol_name: U,
-    vol: &mut T,
-) -> io::Result<MFTEntry> {
+    volume: T,
+    mut mft_reader: U,
+) -> io::Result<MFTEntry<T>> {
     let mut buf = [0u8; 1024];
-    vol.read_exact(&mut buf)?;
+    mft_reader.read_exact(&mut buf)?;
     let mut cur = Cursor::new(buf);
     let header = parse_mft_header(&mut cur)?;
     fixup_buf(sector_size, &header, &mut buf);
@@ -67,7 +67,7 @@ pub fn parse_mft_entry<T: Read + Seek, U: Into<String>>(
     Ok(MFTEntry {
         header,
         attrs,
-        volume: vol_name.into(),
+        volume,
     })
 }
 

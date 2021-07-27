@@ -88,6 +88,19 @@ pub enum Content {
     },
 }
 
+impl Content {
+    pub fn reader<T: Read + Seek>(&self, volume: T) -> ContentReader<T> {
+        match self {
+            Content::Resident { data } => ContentReader::Resident {
+                inner: Cursor::new(data.clone()),
+            },
+            Content::NonResident { runs, .. } => ContentReader::NonResident {
+                inner: RunReader::new(volume, runs.clone()),
+            },
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum ContentReader<T> {
     Resident { inner: Cursor<Rc<[u8]>> },
@@ -100,17 +113,6 @@ impl<T> ContentReader<T> {
             ContentReader::Resident { inner } => inner.get_ref().len().try_into().unwrap(),
             ContentReader::NonResident { inner } => inner.size,
         }
-    }
-}
-
-pub fn content_reader<T: Read + Seek>(volume: T, content: &Content) -> ContentReader<T> {
-    match content {
-        Content::Resident { data } => ContentReader::Resident {
-            inner: Cursor::new(data.clone()),
-        },
-        Content::NonResident { runs, .. } => ContentReader::NonResident {
-            inner: RunReader::new(volume, runs.clone()),
-        },
     }
 }
 

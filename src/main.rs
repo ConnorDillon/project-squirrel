@@ -9,7 +9,7 @@ use std::process::Command;
 use std::{env, str};
 
 use crate::archive::{ArchiveWrite, TarGzWriter};
-use crate::ntfs::MFT;
+use crate::ntfs::{open_volume, MFT};
 
 mod archive;
 mod ntfs;
@@ -289,7 +289,8 @@ fn copy_files<T: ArchiveWrite>(volume: &str, drive: &str, pattern: &str, archive
         "$LogFile" => {
             println!("Copying LogFile");
             let mut mft = MFT::open(volume).unwrap();
-            let entry = mft.open_entry(2).unwrap();
+            let vol = open_volume(volume).unwrap();
+            let mut entry = mft.open_entry(vol, 2).unwrap();
             let data = entry.data().unwrap().unwrap();
             archive
                 .add_file(format!("{}\\{}", drive, "LogFile"), data.size(), data)
@@ -297,11 +298,9 @@ fn copy_files<T: ArchiveWrite>(volume: &str, drive: &str, pattern: &str, archive
         }
         "$MFT" => {
             println!("Copying MFT");
-            let mut mft = MFT::open(volume).unwrap();
-            let entry = mft.open_entry(0).unwrap();
-            let data = entry.data().unwrap().unwrap();
+            let mft = MFT::open(volume).unwrap();
             archive
-                .add_file(format!("{}\\{}", drive, "MFT"), data.size(), data)
+                .add_file(format!("{}\\{}", drive, "MFT"), mft.data.size(), mft.data)
                 .unwrap();
         }
         _ => {
