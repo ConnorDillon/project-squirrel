@@ -12,22 +12,24 @@ pub struct MFTEntry<T> {
 }
 
 impl<T: Read + Seek> MFTEntry<T> {
-    pub fn data(&mut self) -> io::Result<Option<ContentReader<&mut T>>> {
-        for attr in &self.attrs {
-            if attr.attr_type == 128 {
-                return Ok(Some(attr.content.reader(&mut self.volume)));
-            }
-        }
-	Ok(None)
+    pub fn data(&mut self) -> Option<ContentReader<&mut T>> {
+        entry_data(&self.attrs, &mut self.volume)
     }
-    pub fn into_data(self) -> io::Result<Option<ContentReader<T>>> {
-        for attr in self.attrs {
-            if attr.attr_type == 128 {
-                return Ok(Some(attr.content.reader(self.volume)));
-            }
-        }
-	Ok(None)
+    pub fn into_data(self) -> Option<ContentReader<T>> {
+        entry_data(&self.attrs, self.volume)
     }
+}
+
+fn entry_data<T: Read + Seek>(
+    attrs: &Vec<MFTAttr>,
+    volume: T,
+) -> Option<ContentReader<T>> {
+    for attr in attrs {
+        if attr.attr_type == 128 {
+            return Some(attr.content.reader(volume));
+        }
+    }
+    None
 }
 
 #[derive(Debug)]
@@ -42,13 +44,13 @@ pub struct MFTHeader {
 
 #[derive(Debug)]
 pub struct MFTAttr {
-    pub attr_type: u32,
+    attr_type: u32,
     length: u32,
     name_length: u8,
     name_offset: u16,
     flags: u16,
     attr_id: u16,
-    pub content: Content,
+    content: Content,
 }
 
 pub fn parse_mft_entry<T, U: Read>(

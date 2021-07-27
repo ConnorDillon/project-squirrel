@@ -291,7 +291,7 @@ fn copy_files<T: ArchiveWrite>(volume: &str, drive: &str, pattern: &str, archive
             let mut mft = MFT::open(volume).unwrap();
             let vol = open_volume(volume).unwrap();
             let mut entry = mft.open_entry(vol, 2).unwrap();
-            let data = entry.data().unwrap().unwrap();
+            let data = entry.data().unwrap();
             archive
                 .add_file(format!("{}\\{}", drive, "LogFile"), data.size(), data)
                 .unwrap();

@@ -22,7 +22,7 @@ impl MFT {
         let mut buf = [0u8; 1024];
         vol.read_exact(&mut buf)?;
         let entry = parse_mft_entry(boot.sector_size, boot.cluster_size, vol, Cursor::new(buf))?;
-        let data = entry.into_data()?.unwrap();
+        let data = entry.into_data().unwrap();
         Ok(MFT {
             data,
             boot,
@@ -116,7 +116,7 @@ mod tests {
         let mut mft = MFT::open(r#"\\.\C:"#).unwrap();
         let mut vol = open_volume(r#"\\.\C:"#).unwrap();
         let mut entry = mft.open_entry(&mut vol, 2).unwrap();
-        let mut data = entry.data().unwrap().unwrap();
+        let mut data = entry.data().unwrap();
         io::copy(&mut data, &mut dest).unwrap();
         let file_size = dest.metadata().unwrap().len();
         std::fs::remove_file("LogFile").unwrap();
