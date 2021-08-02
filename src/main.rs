@@ -112,7 +112,7 @@ fn read_params(opts: &Options, args: &Vec<String>) -> Params {
         keep_snapshot: matches.opt_present("keep-snapshot"),
         working_dir: matches.opt_str("working-dir").map_or_else(
             || join_path(env::temp_dir(), "squirrel_work"),
-            PathBuf::from,
+            |x| fs::canonicalize(PathBuf::from(x)).unwrap(),
         ),
         destination: matches.opt_str("destination"),
         paths: get_paths(&matches),
@@ -184,7 +184,7 @@ fn main() {
             }
 
             if let Some((shadow_id, mount_point)) = snap {
-                fs::remove_dir(mount_point).unwrap();
+                fs::remove_dir(&mount_point).unwrap();
                 if !params.keep_snapshot {
                     delete_snapshot(&shadow_id);
                 }
