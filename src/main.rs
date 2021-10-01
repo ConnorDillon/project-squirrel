@@ -3,9 +3,7 @@ use glob::glob;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read};
-use std::os::windows::fs::symlink_dir;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::{env, str};
 
 use crate::archive::{ArchiveWrite, TarGzWriter};
@@ -13,6 +11,7 @@ use crate::ntfs::{open_volume, MFT};
 
 mod archive;
 mod ntfs;
+mod snapshot;
 
 fn set_opts() -> Options {
     let mut opts = Options::new();
@@ -168,13 +167,13 @@ fn main() {
                 env::set_current_dir(&drive).unwrap();
                 (format!("\\\\.\\{}:", drive_letter), None)
             } else {
-                let shadow_id = create_snapshot(drive);
+                let shadow_id = snapshot::create(drive);
                 let mount_point = join_path(
                     params.working_dir.clone(),
                     format!("mount-{}", drive_letter),
                 );
-                let device_id = get_device_object(&shadow_id);
-                mount_snapshot(&device_id, &mount_point);
+                let device_id = snapshot::get_device_object(&shadow_id);
+                snapshot::mount(&device_id, &mount_point);
                 env::set_current_dir(&mount_point).unwrap();
                 (device_id, Some((shadow_id, mount_point)))
             };
@@ -186,7 +185,7 @@ fn main() {
             if let Some((shadow_id, mount_point)) = snap {
                 fs::remove_dir(&mount_point).unwrap();
                 if !params.keep_snapshot {
-                    delete_snapshot(&shadow_id);
+                    snapshot::delete(&shadow_id);
                 }
             }
         }
@@ -210,78 +209,6 @@ fn transfer_archive<T: Read>(file: T, dest: &str) {
         .set("Content-Type", "application/octet-stream")
         .send(file)
         .unwrap();
-}
-
-fn create_snapshot(volume: &str) -> String {
-    let command = format!(
-        "ConvertTo-Json (Invoke-CimMethod -ClassName Win32_ShadowCopy -MethodName Create \
-         -Arguments @{{Volume = \"{}\"}})",
-        volume
-    );
-    let output = Command::new("powershell")
-        .arg("-Command")
-        .arg(command)
-        .output()
-        .expect("Failed to execute PowerShell");
-    let stdout = str::from_utf8(&output.stdout).expect("Failed to parse stdout as UTF-8");
-    let stderr = String::from_utf8(output.stderr).expect("Failed to parse stderr as UTF-8");
-    match json::parse(&stdout) {
-        Ok(result) => {
-            let return_value = result["ReturnValue"].as_number().expect("No ReturnValue");
-            if return_value == 0 {
-                let shadow_id = result["ShadowID"].as_str().expect("No ShadowID");
-                return shadow_id.to_string();
-            } else {
-                panic!(
-                    "Snapshot creation failed, return_value: {}, stderr: {}",
-                    return_value, stderr
-                )
-            }
-        }
-        Err(_) => panic!("Snapshot creation failed, stderr: {}", stderr),
-    }
-}
-
-fn delete_snapshot(shadow_id: &str) {
-    let args = [
-        "delete",
-        "shadows",
-        "/quiet",
-        &format!("/shadow={}", shadow_id),
-    ];
-    Command::new("vssadmin")
-        .args(&args)
-        .output()
-        .expect("Failed to execute vssadmin");
-}
-
-fn get_device_object(shadow_id: &str) -> String {
-    let command = format!(
-        "(Get-CimInstance Win32_ShadowCopy | \
-         Where-Object {{ $_.ID -eq \"{}\"}}).DeviceObject",
-        shadow_id
-    );
-    let output = Command::new("powershell")
-        .arg("-Command")
-        .arg(command)
-        .output()
-        .expect("Failed to execute PowerShell");
-    let stderr = str::from_utf8(&output.stderr).expect("Failed to parse stderr as UTF-8");
-    if !stderr.is_empty() {
-        panic!("{}", stderr)
-    }
-    let out = str::from_utf8(&output.stdout)
-        .expect("Failed to parse stdout as UTF-8")
-        .trim_end();
-    String::from(out)
-}
-
-fn mount_snapshot(device_id: &str, mount_point: &Path) {
-    let devid = format!("{}\\", device_id);
-    symlink_dir(&devid, mount_point).expect(&format!(
-        "Failed to create symlink: {} {:?}",
-        devid, mount_point
-    ));
 }
 
 fn copy_files<T: ArchiveWrite>(volume: &str, drive: &str, pattern: &str, archive: &mut T) {
